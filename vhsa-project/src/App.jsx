@@ -1,9 +1,13 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import {
   collection, doc, setDoc, updateDoc,
-  onSnapshot, getDocs, getDoc, deleteDoc
+  onSnapshot, getDoc, deleteDoc, writeBatch
 } from "firebase/firestore";
-import { db } from "./firebase";
+import {
+  onAuthStateChanged, signInWithEmailAndPassword,
+  createUserWithEmailAndPassword, signOut, sendPasswordResetEmail
+} from "firebase/auth";
+import { db, auth } from "./firebase";
 
 // ═══════════════════════════════════════════════════════════
 // CONSTANTS
@@ -13,11 +17,6 @@ const DEFAULT_CONFIG = {
   email:"contacto.logistica.mx@gmail.com", whatsapp:"529931885531", precioPorPaquete:5,
   address:"Fracc. Jose Gorotiza, C. Laguna Mixteca, Edificio 7, Depto 3D, Lagunas, Villahermosa, Tab.",
 };
-const SEED_USERS = [
-  {id:1,email:"admin@logisticavhsa.com",    password:"admin123",    role:"admin",      name:"Administrador",status:"activo"},
-  {id:2,email:"operador@logisticavhsa.com", password:"operador123", role:"operador",   name:"Operador",     status:"activo"},
-  {id:3,email:"repartidor@logisticavhsa.com",password:"reparto123", role:"repartidor", name:"Repartidor",   status:"activo"},
-];
 const CARRIERS = [
   {id:"mercado_libre",name:"Mercado Libre",  refLabel:"Número de compra",  icon:"🟡",mlNote:true},
   {id:"j_t",         name:"J&T Express",    refLabel:"Número de rastreo", icon:"🔴"},
@@ -45,12 +44,23 @@ const now  = () => new Date().toISOString();
 const fmt  = (iso) => iso ? new Date(iso).toLocaleDateString("es-MX",{day:"2-digit",month:"long",year:"numeric",hour:"2-digit",minute:"2-digit"}) : "";
 const hoy  = () => new Date().toISOString().split("T")[0];
 const mes  = () => { const d=new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`; };
-const getCarrier = (id) => CARRIERS.find(c=>c.id===id)||CARRIERS[CARRIERS.length-1];
-const sessionStore = {
-  get:  ()    =>{ try{const s=localStorage.getItem("vhsa_sess");return s?JSON.parse(s):null;}catch{return null;}},
-  set:  (s)   =>{ try{localStorage.setItem("vhsa_sess",JSON.stringify(s));}catch{}},
-  clear:()    =>{ try{localStorage.removeItem("vhsa_sess");}catch{}},
+const safeKey = (x) => String(x).trim().replace(/\//g,"_");
+const maskName = (n) => { if(!n) return ""; const w=String(n).trim().split(/\s+/); return w.map((x,i)=>i===0?x:x[0]+".").join(" "); };
+// Lo único que ve el público: estado y fechas, con el nombre abreviado. Sin teléfono ni dirección.
+const pubDoc = (p) => ({code:p.code,clientRef:p.clientRef||"",carrier:p.carrier||"otra",status:p.status,history:(p.history||[]).map(h=>({status:h.status,date:h.date})),destinatario:maskName(p.clientName),recibidoPor:p.recibidoPor?maskName(p.recibidoPor):"",createdAt:p.createdAt||""});
+const pubKeys = (p) => { const ks=[safeKey(p.code)]; const r=p.clientRef&&p.clientRef.trim(); if(r&&safeKey(r)!==ks[0]) ks.push(safeKey(r)); return ks; };
+const authFlow = { busy:false };
+const loadProfile = async (uid) => { const sn=await getDoc(doc(db,"usuarios",uid)); return sn.exists()?sn.data():null; };
+const authMsg = (e) => {
+  const c=e&&e.code;
+  if(c==="auth/invalid-credential"||c==="auth/wrong-password"||c==="auth/user-not-found"||c==="auth/invalid-email") return "Correo o contraseña incorrectos";
+  if(c==="auth/too-many-requests") return "Demasiados intentos. Espera unos minutos e inténtalo de nuevo.";
+  if(c==="auth/email-already-in-use") return "Ese correo ya está registrado. Si es tuyo, pide al administrador que revise tu cuenta.";
+  if(c==="auth/weak-password") return "La contraseña es muy débil. Usa al menos 8 caracteres.";
+  if(c==="auth/network-request-failed") return "Sin conexión. Revisa tu internet.";
+  return "Ocurrió un error. Intenta de nuevo.";
 };
+const getCarrier = (id) => CARRIERS.find(c=>c.id===id)||CARRIERS[CARRIERS.length-1];
 
 // ═══════════════════════════════════════════════════════════
 // CAMERA SCANNER
@@ -200,7 +210,7 @@ function TrackingResult({ pkg }) {
         <div className="flex justify-between items-start mb-3"><div><p className="text-blue-300 text-xs font-semibold uppercase tracking-wider mb-1">Número de guía</p><p className="font-mono text-white font-bold">{pkg.code}</p></div><StatusBadge status={pkg.status}/></div>
         {pkg.clientRef&&<div className="bg-blue-900 rounded-xl px-3 py-2.5"><div className="flex items-center gap-2 mb-0.5"><span className="text-sm">{carrier.icon}</span><p className="text-blue-300 text-xs font-semibold">{carrier.refLabel} · {carrier.name}</p></div><p className="font-mono text-amber-400 font-bold text-base">{pkg.clientRef}</p></div>}
       </div>
-      <div className="px-4 py-3 bg-slate-50 border-b border-slate-100"><p className="text-xs text-slate-400 uppercase tracking-wide font-semibold mb-0.5">Destinatario</p><p className="font-bold text-slate-800">{pkg.clientName}</p>{pkg.address&&<p className="text-xs text-slate-500 mt-0.5">📍 {pkg.address}</p>}</div>
+      <div className="px-4 py-3 bg-slate-50 border-b border-slate-100"><p className="text-xs text-slate-400 uppercase tracking-wide font-semibold mb-0.5">Destinatario</p><p className="font-bold text-slate-800">{pkg.destinatario||"—"}</p></div>
       <div className="px-4 py-5">
         {steps.map((key,i)=>{const done=cur>=i+1,isCur=cur===i+1,isLast=i===steps.length-1;return(
           <div key={key} className="flex gap-3">
@@ -219,9 +229,9 @@ function TrackingResult({ pkg }) {
 // ═══════════════════════════════════════════════════════════
 // PUBLIC PAGE
 // ═══════════════════════════════════════════════════════════
-function PublicPage({ findPackage, config, onEmployeeAccess }) {
-  const [query,setQuery]=useState(""), [result,setResult]=useState(null), [notFound,setNotFound]=useState(false);
-  const handleSearch=()=>{if(!query.trim())return;const pkg=findPackage(query);setResult(pkg||null);setNotFound(!pkg);if(pkg)setTimeout(()=>document.getElementById("resultado")?.scrollIntoView({behavior:"smooth"}),100);};
+function PublicPage({ lookup, config, onEmployeeAccess }) {
+  const [query,setQuery]=useState(""), [result,setResult]=useState(null), [notFound,setNotFound]=useState(false), [searching,setSearching]=useState(false);
+  const handleSearch=async()=>{const q=query.trim();if(!q||searching)return;setSearching(true);let pkg=null;try{pkg=await lookup(q);}catch(e){console.error(e);}setSearching(false);setResult(pkg||null);setNotFound(!pkg);if(pkg)setTimeout(()=>document.getElementById("resultado")?.scrollIntoView({behavior:"smooth"}),100);};
   return (
     <div className="min-h-screen bg-slate-50">
       <div className="bg-blue-950">
@@ -236,7 +246,7 @@ function PublicPage({ findPackage, config, onEmployeeAccess }) {
           <div className="bg-white rounded-2xl p-3 shadow-2xl shadow-blue-950">
             <div className="flex gap-2">
               <input type="text" value={query} onChange={e=>{setQuery(e.target.value);setNotFound(false);setResult(null);}} onKeyDown={e=>e.key==="Enter"&&handleSearch()} placeholder="Ej. JT0012345678 o 2000987654..." className="flex-1 px-3 py-3 text-sm text-slate-700 font-mono bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:border-blue-700"/>
-              <button onClick={handleSearch} className="bg-blue-950 hover:bg-blue-900 text-white px-5 rounded-xl text-sm font-bold">Buscar</button>
+              <button onClick={handleSearch} disabled={searching} className="bg-blue-950 hover:bg-blue-900 disabled:bg-blue-300 text-white px-5 rounded-xl text-sm font-bold">{searching?"...":"Buscar"}</button>
             </div>
             <p className="text-xs text-slate-400 mt-2 text-left px-1">Puedes usar el número de guía, de compra o de pedido</p>
           </div>
@@ -296,15 +306,27 @@ function PublicPage({ findPackage, config, onEmployeeAccess }) {
 // ═══════════════════════════════════════════════════════════
 // LOGIN VIEW
 // ═══════════════════════════════════════════════════════════
-function LoginView({ users, onLogin, onBack, onRegistro }) {
+function LoginView({ onLogin, onBack, onRegistro }) {
   const [email,setEmail]=useState(""), [password,setPassword]=useState(""), [showPass,setShowPass]=useState(false);
-  const [error,setError]=useState(""), [loading,setLoading]=useState(false);
+  const [error,setError]=useState(""), [info,setInfo]=useState(""), [loading,setLoading]=useState(false);
+  const forgot=async()=>{
+    if(!email.trim()){setError("Escribe tu correo arriba y vuelve a presionar.");return;}
+    try{await sendPasswordResetEmail(auth,email.trim().toLowerCase());}catch(e){console.error(e);}
+    setError("");setInfo("Si el correo está registrado, te enviamos un enlace para cambiar tu contraseña.");
+  };
   const handle=async()=>{
     if(!email.trim()||!password){setError("Completa todos los campos");return;}
-    setLoading(true);setError("");await new Promise(r=>setTimeout(r,350));
-    const user=users.find(u=>u.email.toLowerCase()===email.trim().toLowerCase()&&u.password===password);
-    if(user){if(user.status==="pendiente"){setError("Tu cuenta está pendiente de aprobación.");setLoading(false);return;}if(user.status==="rechazado"){setError("Tu cuenta fue rechazada. Contacta al admin.");setLoading(false);return;}onLogin(user);}
-    else{setError("Correo o contraseña incorrectos");setLoading(false);}
+    setLoading(true);setError("");setInfo("");
+    authFlow.busy=true;
+    try{
+      const cred=await signInWithEmailAndPassword(auth,email.trim().toLowerCase(),password);
+      const prof=await loadProfile(cred.user.uid);
+      if(!prof){await signOut(auth);setError("Tu cuenta no tiene perfil. Contacta al administrador.");}
+      else if(prof.status==="pendiente"){await signOut(auth);setError("Tu cuenta está pendiente de aprobación.");}
+      else if(prof.status!=="activo"){await signOut(auth);setError("Tu cuenta no está activa. Contacta al admin.");}
+      else{authFlow.busy=false;onLogin({id:cred.user.uid,email:prof.email,name:prof.name,role:prof.role});return;}
+    }catch(e){console.error(e);try{await signOut(auth);}catch{}setError(authMsg(e));}
+    authFlow.busy=false;setLoading(false);
   };
   return(
     <div className="min-h-screen bg-blue-950 flex flex-col">
@@ -317,7 +339,9 @@ function LoginView({ users, onLogin, onBack, onRegistro }) {
           <div><label className="text-xs font-bold text-slate-600 block mb-1.5">Correo</label><input type="email" value={email} onChange={e=>{setEmail(e.target.value);setError("");}} onKeyDown={e=>e.key==="Enter"&&handle()} placeholder="correo@ejemplo.com" className="w-full border-2 border-slate-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-blue-700 focus:ring-4 focus:ring-blue-50"/></div>
           <div><label className="text-xs font-bold text-slate-600 block mb-1.5">Contraseña</label><div className="relative"><input type={showPass?"text":"password"} value={password} onChange={e=>{setPassword(e.target.value);setError("");}} onKeyDown={e=>e.key==="Enter"&&handle()} placeholder="••••••••" className="w-full border-2 border-slate-200 rounded-xl px-4 py-3 pr-12 text-sm focus:outline-none focus:border-blue-700 focus:ring-4 focus:ring-blue-50"/><button onClick={()=>setShowPass(p=>!p)} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 text-lg">{showPass?"🙈":"👁"}</button></div></div>
           {error&&<div className="bg-red-50 border border-red-200 rounded-xl px-4 py-2.5 text-red-600 text-sm font-medium">❌ {error}</div>}
+          {info&&<div className="bg-emerald-50 border border-emerald-200 rounded-xl px-4 py-2.5 text-emerald-700 text-sm font-medium">✉️ {info}</div>}
           <button onClick={handle} disabled={loading} className="w-full bg-blue-950 hover:bg-blue-900 disabled:bg-blue-300 text-white py-3.5 rounded-xl font-bold">{loading?"Verificando...":"Iniciar sesión →"}</button>
+          <button onClick={forgot} className="w-full text-blue-800 text-xs font-semibold underline">¿Olvidaste tu contraseña?</button>
         </div>
         <div className="mt-5 pt-5 border-t border-slate-200 text-center"><p className="text-slate-500 text-sm mb-2">¿Eres empleado nuevo?</p><button onClick={onRegistro} className="w-full border-2 border-blue-950 text-blue-950 hover:bg-blue-50 py-3 rounded-xl font-bold text-sm">Crear mi cuenta →</button></div>
       </div></div>
@@ -328,18 +352,20 @@ function LoginView({ users, onLogin, onBack, onRegistro }) {
 // ═══════════════════════════════════════════════════════════
 // REGISTRO VIEW
 // ═══════════════════════════════════════════════════════════
-function RegistroView({ users, setUsers, onBack, onSuccess }) {
+function RegistroView({ onBack, onSuccess }) {
   const [form,setForm]=useState({name:"",email:"",password:"",confirm:"",role:"operador"});
   const [error,setError]=useState(""), [loading,setLoading]=useState(false);
   const handle=async()=>{
     if(!form.name.trim()||!form.email.trim()||!form.password){setError("Completa todos los campos");return;}
-    if(form.password.length<6){setError("La contraseña debe tener mínimo 6 caracteres");return;}
+    if(form.password.length<8){setError("La contraseña debe tener mínimo 8 caracteres");return;}
     if(form.password!==form.confirm){setError("Las contraseñas no coinciden");return;}
-    if(users.find(u=>u.email.toLowerCase()===form.email.toLowerCase())){setError("Ese correo ya está registrado");return;}
-    setLoading(true);setError("");
-    const u={id:Date.now(),name:form.name.trim(),email:form.email.trim().toLowerCase(),password:form.password,role:form.role,status:"pendiente",createdAt:now()};
-    try{await setDoc(doc(db,"usuarios",String(u.id)),u);setUsers(prev=>[...prev,u]);onSuccess();}
-    catch{setError("Error al registrar. Intenta de nuevo.");setLoading(false);}
+    setLoading(true);setError("");authFlow.busy=true;
+    try{
+      const email=form.email.trim().toLowerCase();
+      const cred=await createUserWithEmailAndPassword(auth,email,form.password);
+      await setDoc(doc(db,"usuarios",cred.user.uid),{name:form.name.trim(),email,role:form.role==="repartidor"?"repartidor":"operador",status:"pendiente",createdAt:now()});
+      await signOut(auth);authFlow.busy=false;onSuccess();
+    }catch(e){console.error(e);try{await signOut(auth);}catch{}authFlow.busy=false;setError(authMsg(e));setLoading(false);}
   };
   return(
     <div className="min-h-screen bg-blue-950 flex flex-col">
@@ -349,7 +375,7 @@ function RegistroView({ users, setUsers, onBack, onSuccess }) {
         <h2 className="text-xl font-black text-slate-800 mb-1">Crear mi cuenta</h2>
         <p className="text-slate-500 text-sm mb-6">El administrador revisará tu solicitud antes de activarla</p>
         <div className="space-y-4">
-          {[{k:"name",label:"Nombre completo",ph:"Ej. María López",type:"text"},{k:"email",label:"Correo",ph:"tucorreo@ejemplo.com",type:"email"},{k:"password",label:"Contraseña",ph:"Mínimo 6 caracteres",type:"password"},{k:"confirm",label:"Confirmar contraseña",ph:"Repite tu contraseña",type:"password"}].map(f=>(
+          {[{k:"name",label:"Nombre completo",ph:"Ej. María López",type:"text"},{k:"email",label:"Correo",ph:"tucorreo@ejemplo.com",type:"email"},{k:"password",label:"Contraseña",ph:"Mínimo 8 caracteres",type:"password"},{k:"confirm",label:"Confirmar contraseña",ph:"Repite tu contraseña",type:"password"}].map(f=>(
             <div key={f.k}><label className="text-xs font-bold text-slate-600 block mb-1.5">{f.label}</label><input type={f.type} value={form[f.k]} onChange={e=>{setForm(p=>({...p,[f.k]:e.target.value}));setError("");}} placeholder={f.ph} className="w-full border-2 border-slate-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-blue-700 focus:ring-4 focus:ring-blue-50"/></div>
           ))}
           <div><label className="text-xs font-bold text-slate-600 block mb-1.5">Tipo de trabajo</label>
@@ -553,7 +579,7 @@ function OperadorView({ packages, clientes, findPackage, addPackage, updatePacka
 // ═══════════════════════════════════════════════════════════
 // REPARTIDOR VIEW (with dashboard, camera, bulk delivery)
 // ═══════════════════════════════════════════════════════════
-function RepartidorView({ packages, findPackage, updatePackage, showNotif, sess }) {
+function RepartidorView({ packages, findPackage, updatePackage, onDeliver, showNotif, sess }) {
   const [sub,setSub]=useState("scan");
   const [code,setCode]=useState(""), [pkg,setPkg]=useState(null), [searched,setSearched]=useState(false), [done,setDone]=useState(false);
   const [recibidoPor,setRecibidoPor]=useState("");
@@ -580,8 +606,7 @@ function RepartidorView({ packages, findPackage, updatePackage, showNotif, sess 
   const handleDeliver=async(pkgToDeliver,nombreRecibio)=>{
     const target=pkgToDeliver||pkg;if(!target)return;
     try{
-      const histEntry={status:"entregado",date:now()};
-      await updateDoc(doc(db,"paquetes",target.code),{status:"entregado",history:[...target.history,histEntry],recibidoPor:nombreRecibio||target.clientName});
+      await onDeliver([target],nombreRecibio||target.clientName);
       setDone(true);showNotif(`✅ Entregado a ${target.clientName}`);
       if(!pkgToDeliver)setTimeout(()=>{setCode("");setPkg(null);setSearched(false);setDone(false);setRecibidoPor("");inputRef.current?.focus();},3000);
     }catch{showNotif("Error al confirmar","err");}
@@ -589,7 +614,7 @@ function RepartidorView({ packages, findPackage, updatePackage, showNotif, sess 
 
   const handleBulkDeliver=async(clientName,pkgs)=>{
     try{
-      await Promise.all(pkgs.map(p=>updateDoc(doc(db,"paquetes",p.code),{status:"entregado",history:[...p.history,{status:"entregado",date:now()}],recibidoPor:clientName})));
+      await onDeliver(pkgs,clientName);
       showNotif(`✅ ${pkgs.length} paquetes entregados a ${clientName}`);
     }catch{showNotif("Error al entregar","err");}
   };
@@ -726,10 +751,10 @@ function ComisionesView({ packages, users, config }) {
 // ═══════════════════════════════════════════════════════════
 // EMPLEADOS VIEW
 // ═══════════════════════════════════════════════════════════
-function EmpleadosView({ users, setUsers, showNotif }) {
+function EmpleadosView({ users, showNotif }) {
   const pendientes=users.filter(u=>u.status==="pendiente"), activos=users.filter(u=>u.status==="activo");
-  const updateStatus=async(id,status)=>{try{await updateDoc(doc(db,"usuarios",String(id)),{status});setUsers(prev=>prev.map(u=>u.id===id?{...u,status}:u));showNotif(status==="activo"?"✅ Empleado aprobado":"❌ Rechazado");}catch{showNotif("Error","err");}};
-  const handleDelete=async(id)=>{if(activos.length<=1){showNotif("No puedes eliminar el último empleado activo","err");return;}try{await deleteDoc(doc(db,"usuarios",String(id)));setUsers(prev=>prev.filter(u=>u.id!==id));showNotif("Empleado eliminado");}catch{showNotif("Error","err");}};
+  const updateStatus=async(id,status)=>{try{await updateDoc(doc(db,"usuarios",String(id)),{status});showNotif(status==="activo"?"✅ Empleado aprobado":"❌ Rechazado");}catch{showNotif("Error","err");}};
+  const handleDelete=async(id)=>{if(activos.length<=1){showNotif("No puedes eliminar el último empleado activo","err");return;}try{await deleteDoc(doc(db,"usuarios",String(id)));showNotif("Empleado eliminado");}catch{showNotif("Error","err");}};
   return(
     <div className="space-y-4">
       {pendientes.length>0&&(
@@ -783,7 +808,7 @@ function ConfigView({ config, setConfig, showNotif }) {
 // EMPLOYEE SHELL
 // ═══════════════════════════════════════════════════════════
 function EmployeeShell({ sess, onLogout, tab, setTab, pendientesCount, children }) {
-  const tabs=[{k:"operador",icon:"📦",label:"Paquetes"},{k:"comisiones",icon:"📊",label:"Comisiones"},{k:"empleados",icon:"👥",label:"Empleados"},{k:"config",icon:"⚙️",label:"Config"}];
+  const tabs=[{k:"operador",icon:"📦",label:"Paquetes"},{k:"comisiones",icon:"📊",label:"Comisiones"},{k:"empleados",icon:"👥",label:"Empleados"},{k:"config",icon:"⚙️",label:"Config"}].filter(t=>sess.role==="admin"||t.k==="operador"||t.k==="comisiones");
   const isAdmin=sess.role==="admin"||sess.role==="operador";
   return(
     <div className="min-h-screen bg-slate-50">
@@ -824,41 +849,70 @@ export default function App() {
   const [clientes,setClientes]=useState([]);
   const [users,setUsers]=useState([]);
   const [config,setConfig]=useState(DEFAULT_CONFIG);
-  const [loaded,setLoaded]=useState(false);
+  const [authReady,setAuthReady]=useState(false);
+  const [cfgReady,setCfgReady]=useState(false);
+  const [loadError,setLoadError]=useState("");
   const [notif,setNotif]=useState(null);
   const [opTab,setOpTab]=useState("operador");
 
+  const applySess=(x)=>setSess(prev=>prev&&prev.id===x.id&&prev.role===x.role&&prev.name===x.name?prev:x);
+
+  // Datos públicos (teléfonos, dirección del negocio)
   useEffect(()=>{
-    const saved=sessionStore.get();if(saved){setSess(saved);setScreen("employee");}
-    getDocs(collection(db,"usuarios")).then(snap=>{if(snap.empty){SEED_USERS.forEach(u=>setDoc(doc(db,"usuarios",String(u.id)),u));setUsers(SEED_USERS);}else{setUsers(snap.docs.map(d=>d.data()));}}).catch(console.error);
-    getDoc(doc(db,"config","general")).then(snap=>{if(snap.exists())setConfig({...DEFAULT_CONFIG,...snap.data()});}).catch(console.error);
-    getDocs(collection(db,"clientes")).then(snap=>{setClientes(snap.docs.map(d=>d.data()));}).catch(console.error);
+    getDoc(doc(db,"config","general")).then(sn=>{if(sn.exists())setConfig({...DEFAULT_CONFIG,...sn.data()});}).catch(console.error).finally(()=>setCfgReady(true));
   },[]);
 
-  useEffect(()=>{
-    const unsub=onSnapshot(collection(db,"paquetes"),snap=>{
-      const pkgs=snap.docs.map(d=>d.data());pkgs.sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));setPackages(pkgs);setLoaded(true);
-    },console.error);
-    return()=>unsub();
-  },[]);
+  // Sesión: la maneja Firebase Authentication
+  useEffect(()=>onAuthStateChanged(auth,async(u)=>{
+    if(authFlow.busy)return;
+    if(!u){setSess(null);setScreen(sc=>sc==="employee"?"public":sc);setAuthReady(true);return;}
+    try{
+      const prof=await loadProfile(u.uid);
+      if(authFlow.busy)return;
+      if(prof&&prof.status==="activo"){applySess({id:u.uid,email:prof.email,name:prof.name,role:prof.role});setScreen("employee");}
+      else{await signOut(auth);setSess(null);}
+    }catch(e){console.error(e);setSess(null);}
+    setAuthReady(true);
+  }),[]);
 
-  // Listen for new clients too
+  // Datos privados: solo con sesión de empleado activo
   useEffect(()=>{
-    const unsub=onSnapshot(collection(db,"clientes"),snap=>{setClientes(snap.docs.map(d=>d.data()));},()=>{});
-    return()=>unsub();
-  },[]);
+    if(!sess){setPackages([]);setUsers([]);setClientes([]);return;}
+    const fail=(e)=>{console.error(e);setLoadError(e&&e.code?e.code:String(e));};
+    const unsubs=[];
+    unsubs.push(onSnapshot(collection(db,"paquetes"),snap=>{
+      const pkgs=snap.docs.map(d=>d.data());pkgs.sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));setPackages(pkgs);
+    },fail));
+    unsubs.push(onSnapshot(collection(db,"usuarios"),snap=>{setUsers(snap.docs.map(d=>({...d.data(),id:d.id})));},fail));
+    if(sess.role!=="repartidor")unsubs.push(onSnapshot(collection(db,"clientes"),snap=>{setClientes(snap.docs.map(d=>d.data()));},fail));
+    return()=>unsubs.forEach(f=>f());
+  },[sess]);
 
   const showNotif=(msg,type="ok")=>{setNotif({msg,type});setTimeout(()=>setNotif(null),3000);};
-  const handleLogin=(user)=>{const s={id:user.id,email:user.email,name:user.name,role:user.role};setSess(s);sessionStore.set(s);setScreen("employee");setOpTab("operador");};
-  const handleLogout=()=>{setSess(null);sessionStore.clear();setScreen("public");};
-  const addPackage=(pkg)=>setDoc(doc(db,"paquetes",pkg.code),pkg);
-  const updatePackage=(code,status)=>{const pkg=packages.find(p=>p.code===code);if(!pkg)return;return updateDoc(doc(db,"paquetes",code),{status,history:[...pkg.history,{status,date:now()}]});};
+  const handleLogin=(user)=>{applySess({id:user.id,email:user.email,name:user.name,role:user.role});setScreen("employee");setOpTab("operador");};
+  const handleLogout=async()=>{try{await signOut(auth);}catch(e){console.error(e);}setSess(null);setLoadError("");setScreen("public");};
+
+  // Cada cambio escribe el paquete (privado) y su copia pública mínima en una sola operación
+  const addPackage=async(pkg)=>{const b=writeBatch(db);b.set(doc(db,"paquetes",pkg.code),pkg);pubKeys(pkg).forEach(k=>b.set(doc(db,"seguimiento",k),pubDoc(pkg)));await b.commit();};
+  const applyStatus=async(pkgs,status,extra={})=>{
+    const b=writeBatch(db);
+    pkgs.forEach(p=>{
+      const upd={...p,status,history:[...(p.history||[]),{status,date:now()}],...extra};
+      b.update(doc(db,"paquetes",p.code),{status:upd.status,history:upd.history,...extra});
+      pubKeys(p).forEach(k=>b.set(doc(db,"seguimiento",k),pubDoc(upd),{merge:true}));
+    });
+    await b.commit();
+  };
+  const updatePackage=(code,status)=>{const pkg=packages.find(p=>p.code===code);if(!pkg)return;return applyStatus([pkg],status);};
+  const deliverPackages=(pkgs,recibidoPor)=>applyStatus(pkgs,"entregado",{recibidoPor});
   const findPackage=(q)=>{const t=q.trim();return packages.find(p=>p.code===t||(p.clientRef&&p.clientRef===t));};
+  const lookupPublic=async(q)=>{const k=safeKey(q);if(!k||k==="."||k==="..")return null;const sn=await getDoc(doc(db,"seguimiento",k));return sn.exists()?sn.data():null;};
   const pendientesCount=users.filter(u=>u.status==="pendiente").length;
 
-  if(!loaded)return<div className="flex flex-col items-center justify-center min-h-screen bg-blue-950 gap-3"><div className="text-5xl animate-bounce">🚚</div><p className="text-blue-300 font-semibold">Cargando Logística VHSA...</p></div>;
-  if(screen==="login")    return<LoginView users={users} onLogin={handleLogin} onBack={()=>setScreen("public")} onRegistro={()=>setScreen("registro")}/>;
-  if(screen==="registro") return<RegistroView users={users} setUsers={setUsers} onBack={()=>setScreen("login")} onSuccess={()=>setScreen("pendiente")}/>;
+  if(loadError&&sess)return<div className="flex flex-col items-center justify-center min-h-screen bg-blue-950 gap-4 p-6 text-center"><div className="text-5xl">⚠️</div><p className="text-white font-bold text-lg">No se pudo cargar la información</p><p className="text-blue-200 text-sm max-w-sm">Código: <b>{loadError}</b>. Si dice "permission-denied", tu cuenta no tiene permiso o las reglas de Firestore no están bien publicadas.</p><button onClick={()=>window.location.reload()} className="bg-white text-blue-950 px-6 py-3 rounded-xl font-bold">Reintentar</button><button onClick={handleLogout} className="text-blue-300 text-sm underline">Cerrar sesión</button></div>;
+  if(!(authReady&&cfgReady))return<div className="flex flex-col items-center justify-center min-h-screen bg-blue-950 gap-3"><div className="text-5xl animate-bounce">🚚</div><p className="text-blue-300 font-semibold">Cargando Logística VHSA...</p></div>;
+  if(screen==="login")    return<LoginView onLogin={handleLogin} onBack={()=>setScreen("public")} onRegistro={()=>setScreen("registro")}/>;
+  if(screen==="registro") return<RegistroView onBack={()=>setScreen("login")} onSuccess={()=>setScreen("pendiente")}/>;
   if(screen==="pendiente")return<PendienteView onBack={()=>setScreen("public")}/>;
 
   if(screen==="employee"&&sess)return(
@@ -866,11 +920,11 @@ export default function App() {
       <Toast notif={notif}/>
       {(sess.role==="operador"||sess.role==="admin")&&opTab==="operador"   &&<OperadorView packages={packages} clientes={clientes} findPackage={findPackage} addPackage={addPackage} updatePackage={updatePackage} showNotif={showNotif} sess={sess}/>}
       {(sess.role==="operador"||sess.role==="admin")&&opTab==="comisiones" &&<ComisionesView packages={packages} users={users} config={config}/>}
-      {(sess.role==="operador"||sess.role==="admin")&&opTab==="empleados"  &&<EmpleadosView users={users} setUsers={setUsers} showNotif={showNotif}/>}
-      {(sess.role==="operador"||sess.role==="admin")&&opTab==="config"     &&<ConfigView config={config} setConfig={setConfig} showNotif={showNotif}/>}
-      {sess.role==="repartidor"&&<RepartidorView packages={packages} findPackage={findPackage} updatePackage={updatePackage} showNotif={showNotif} sess={sess}/>}
+      {sess.role==="admin"&&opTab==="empleados"&&<EmpleadosView users={users} showNotif={showNotif}/>}
+      {sess.role==="admin"&&opTab==="config"   &&<ConfigView config={config} setConfig={setConfig} showNotif={showNotif}/>}
+      {sess.role==="repartidor"&&<RepartidorView packages={packages} findPackage={findPackage} updatePackage={updatePackage} onDeliver={deliverPackages} showNotif={showNotif} sess={sess}/>}
     </EmployeeShell>
   );
 
-  return<><Toast notif={notif}/><PublicPage findPackage={findPackage} config={config} onEmployeeAccess={()=>setScreen("login")}/></>;
+  return<><Toast notif={notif}/><PublicPage lookup={lookupPublic} config={config} onEmployeeAccess={()=>setScreen("login")}/></>;
 }
